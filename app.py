@@ -13,12 +13,20 @@ from typing import Any, Dict
 
 from flask import Flask, Request, Response, render_template_string, request
 
+from magnet import validate_magnet
 
-LOG_PATH = Path("logs/submissions.jsonl")
+
+def _env_flag(name: str, default: str = "0") -> bool:
+  return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+LOG_PATH = Path(os.environ.get("SUBMISSION_LOG_PATH", "logs/submissions.jsonl"))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "dev-secret-key")
+app.config["MAGNET_REACHABILITY_PROBE"] = _env_flag("MAGNET_REACHABILITY_PROBE", "0")
+app.config["MAGNET_REACHABILITY_TIMEOUT"] = float(os.environ.get("MAGNET_REACHABILITY_TIMEOUT", "2.0"))
 
 
 TEMPLATE = """
@@ -151,13 +159,29 @@ def submit() -> Response | str:
       message="Please provide a magnet link.",
     )
 
+  validation = validate_magnet(
+    magnet_link,
+    probe_reachability=app.config["MAGNET_REACHABILITY_PROBE"],
+    probe_timeout=app.config["MAGNET_REACHABILITY_TIMEOUT"],
+  )
+
   entry = {
     "received_at": datetime.now(timezone.utc).isoformat(),
     "client_ip": _client_ip(request),
     "user_agent": request.headers.get("User-Agent", ""),
     "magnet_link": magnet_link,
+    "status": "accepted" if validation.is_valid else "rejected",
+    "validation": validation.to_dict(),
   }
   _log_submission(entry)
+
+  if not validation.is_valid:
+    reasons = "; ".join(validation.errors)
+    return (
+      render_template_string(TEMPLATE, message=f"Invalid magnet link: {reasons}"),
+      400,
+    )
+
   return render_template_string(TEMPLATE, message="Magnet link received. Thank you!")
 
 
