@@ -13,6 +13,8 @@ from typing import Any, Dict
 
 from flask import Flask, Request, Response, render_template_string, request
 
+from magnet_utils import MagnetValidationResult, validate_magnet_link
+
 
 LOG_PATH = Path("logs/submissions.jsonl")
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -151,11 +153,21 @@ def submit() -> Response | str:
       message="Please provide a magnet link.",
     )
 
+  validation: MagnetValidationResult = validate_magnet_link(magnet_link)
+  if not validation.is_valid:
+    return render_template_string(
+      TEMPLATE,
+      message=f"Invalid magnet link: {validation.first_error()}",
+    )
+
   entry = {
     "received_at": datetime.now(timezone.utc).isoformat(),
     "client_ip": _client_ip(request),
     "user_agent": request.headers.get("User-Agent", ""),
     "magnet_link": magnet_link,
+    "btih_xt": validation.xt,
+    "btih_info_hash": validation.info_hash,
+    "btih_encoding": validation.info_hash_encoding,
   }
   _log_submission(entry)
   return render_template_string(TEMPLATE, message="Magnet link received. Thank you!")
