@@ -5,52 +5,33 @@ and logs submitted magnet links as JSON lines on disk.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
-from flask import Flask, Request, Response, jsonify, render_template_string, request
+from flask import (
+  Flask,
+  Request,
+  Response,
+  current_app,
+  jsonify,
+  render_template_string,
+  request,
+)
 
-from config import AppConfig, QbittorrentConfig, load_config
+from config import AppConfig, QbittorrentConfig, RetryPolicy, load_config
 from magnet import validate_magnet
 from qbittorrent import (
+  AuthenticationError,
   QbittorrentClient,
   QbittorrentError,
   TorrentDuplicateError,
+  TorrentRejectedError,
   TorrentServerUnavailable,
 )
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-  return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
-
-
-LOG_PATH = Path(os.environ.get("SUBMISSION_LOG_PATH", "logs/submissions.jsonl"))
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-APP_CONFIG: AppConfig = load_config()
-JOB_LOG_PATH = APP_CONFIG.job_log_path
-
-QBITTORRENT_CLIENT: Optional[QbittorrentClient] = None
-if APP_CONFIG.qbittorrent:
-  qb_cfg = APP_CONFIG.qbittorrent
-  QBITTORRENT_CLIENT = QbittorrentClient(
-    base_url=qb_cfg.url,
-    username=qb_cfg.username,
-    password=qb_cfg.password,
-    category=qb_cfg.category,
-    timeout=qb_cfg.timeout,
-  )
-
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "dev-secret-key")
-app.config["MAGNET_REACHABILITY_PROBE"] = _env_flag("MAGNET_REACHABILITY_PROBE", "0")
-app.config["MAGNET_REACHABILITY_TIMEOUT"] = float(os.environ.get("MAGNET_REACHABILITY_TIMEOUT", "2.0"))
-app.config["APP_CONFIG"] = APP_CONFIG
+from storage import LogStorage
 
 
 TEMPLATE = """
@@ -154,38 +135,124 @@ TEMPLATE = """
 """
 
 
+def create_app(
+  config: AppConfig | None = None,
+  *,
+  qb_client_factory: Callable[[QbittorrentConfig], QbittorrentClient] | None = None,
+) -> Flask:
+  config = config or load_config()
+  app = Flask(__name__)
+  app.config["SECRET_KEY"] = config.secret_key
+  app.config["APP_CONFIG"] = config
+  app.extensions["logs"] = LogStorage(config.storage)
+  app.extensions["qb_client"] = None
+
+  if config.qbittorrent:
+    factory = qb_client_factory or _build_qbittorrent_client
+    app.extensions["qb_client"] = factory(config.qbittorrent)
+
+  @app.get("/")
+  def home() -> str:
+    return render_template_string(TEMPLATE, message=None)
+
+  @app.post("/submit")
+  def submit() -> Response | str:
+    cfg: AppConfig = current_app.config["APP_CONFIG"]
+    logs: LogStorage = current_app.extensions["logs"]
+
+    magnet_link = request.form.get("magnet", "").strip()
+    if not magnet_link:
+      return render_template_string(
+        TEMPLATE,
+        message="Please provide a magnet link.",
+      )
+
+    validation = validate_magnet(
+      magnet_link,
+      probe_reachability=cfg.magnet_probe.enabled,
+      probe_timeout=cfg.magnet_probe.timeout,
+    )
+
+    entry = {
+      "received_at": datetime.now(timezone.utc).isoformat(),
+      "client_ip": _client_ip(request),
+      "user_agent": request.headers.get("User-Agent", ""),
+      "magnet_link": magnet_link,
+      "status": "accepted" if validation.is_valid else "rejected",
+      "validation": validation.to_dict(),
+    }
+    logs.submissions.append(entry)
+
+    if not validation.is_valid:
+      reasons = "; ".join(validation.errors)
+      return (
+        render_template_string(TEMPLATE, message=f"Invalid magnet link: {reasons}"),
+        400,
+      )
+
+    if not cfg.qbittorrent:
+      return render_template_string(
+        TEMPLATE,
+        message="Magnet link received. qBittorrent integration is disabled.",
+      )
+
+    enqueue_result = _dispatch_to_qbittorrent(
+      magnet_link=magnet_link,
+      info_hash=validation.components.get("info_hash"),
+      qb_cfg=cfg.qbittorrent,
+      retry=cfg.qbittorrent_retry,
+      qb_client=current_app.extensions.get("qb_client"),
+      logs=logs,
+    )
+
+    if not enqueue_result["ok"]:
+      payload = {"error": enqueue_result["message"]}
+      status_code = enqueue_result["status"]
+      if _wants_json(request):
+        return jsonify(payload), status_code
+      return render_template_string(TEMPLATE, message=enqueue_result["message"]), status_code
+
+    status_code = 202
+    payload = {
+      "job_id": enqueue_result["job"]["job_id"],
+      "info_hash": enqueue_result["job"]["info_hash"],
+      "status": enqueue_result["job"]["status"],
+      "message": "Magnet link queued with qBittorrent.",
+    }
+    if _wants_json(request):
+      return jsonify(payload), status_code
+    return render_template_string(
+      TEMPLATE,
+      message=f"Magnet accepted as job {payload['job_id']} (status {payload['status']}).",
+    ), status_code
+
+  @app.get("/jobs/<job_id>")
+  def job_status(job_id: str) -> Response:
+    logs: LogStorage = current_app.extensions["logs"]
+    job = logs.jobs.find_one("job_id", job_id)
+    if not job:
+      return jsonify({"error": f"Job '{job_id}' not found."}), 404
+    return jsonify(job)
+
+  return app
+
+
+def _build_qbittorrent_client(qb_cfg: QbittorrentConfig) -> QbittorrentClient:
+  return QbittorrentClient(
+    base_url=qb_cfg.url,
+    username=qb_cfg.username,
+    password=qb_cfg.password,
+    category=qb_cfg.category,
+    timeout=qb_cfg.timeout,
+  )
+
+
 def _client_ip(req: Request) -> str:
   """Return the best-effort client IP address."""
   forwarded_for = req.headers.get("X-Forwarded-For")
   if forwarded_for:
-    # Take the first IP in the comma-separated list.
     return forwarded_for.split(",")[0].strip()
   return req.remote_addr or "unknown"
-
-
-def _log_submission(payload: Dict[str, Any]) -> None:
-  """Append a JSON entry to the log file."""
-  with LOG_PATH.open("a", encoding="utf-8") as fp:
-    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def _log_job(payload: Dict[str, Any]) -> None:
-  with JOB_LOG_PATH.open("a", encoding="utf-8") as fp:
-    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def _load_job(job_id: str) -> Optional[Dict[str, Any]]:
-  if not JOB_LOG_PATH.exists():
-    return None
-  with JOB_LOG_PATH.open("r", encoding="utf-8") as fp:
-    for line in fp:
-      try:
-        entry = json.loads(line)
-      except json.JSONDecodeError:
-        continue
-      if entry.get("job_id") == job_id:
-        return entry
-  return None
 
 
 def _wants_json(req: Request) -> bool:
@@ -193,96 +260,27 @@ def _wants_json(req: Request) -> bool:
   return "application/json" in accept_header.lower()
 
 
-@app.get("/")
-def home() -> str:
-  return render_template_string(TEMPLATE, message=None)
-
-
-@app.post("/submit")
-def submit() -> Response | str:
-  magnet_link = request.form.get("magnet", "").strip()
-  if not magnet_link:
-    return render_template_string(
-      TEMPLATE,
-      message="Please provide a magnet link.",
-    )
-
-  validation = validate_magnet(
-    magnet_link,
-    probe_reachability=app.config["MAGNET_REACHABILITY_PROBE"],
-    probe_timeout=app.config["MAGNET_REACHABILITY_TIMEOUT"],
-  )
-
-  entry = {
-    "received_at": datetime.now(timezone.utc).isoformat(),
-    "client_ip": _client_ip(request),
-    "user_agent": request.headers.get("User-Agent", ""),
-    "magnet_link": magnet_link,
-    "status": "accepted" if validation.is_valid else "rejected",
-    "validation": validation.to_dict(),
-  }
-  _log_submission(entry)
-
-  if not validation.is_valid:
-    reasons = "; ".join(validation.errors)
-    return (
-      render_template_string(TEMPLATE, message=f"Invalid magnet link: {reasons}"),
-      400,
-    )
-
-  if not APP_CONFIG.qbittorrent:
-    return render_template_string(
-      TEMPLATE,
-      message="Magnet link received. qBittorrent integration is disabled.",
-    )
-
-  enqueue_result = _dispatch_to_qbittorrent(
-    magnet_link,
-    validation.components.get("info_hash"),
-    APP_CONFIG.qbittorrent,
-  )
-
-  if not enqueue_result["ok"]:
-    payload = {"error": enqueue_result["message"]}
-    status_code = enqueue_result["status"]
-    if _wants_json(request):
-      return jsonify(payload), status_code
-    return render_template_string(TEMPLATE, message=enqueue_result["message"]), status_code
-
-  status_code = 202
-  payload = {
-    "job_id": enqueue_result["job"]["job_id"],
-    "info_hash": enqueue_result["job"]["info_hash"],
-    "status": enqueue_result["job"]["status"],
-    "message": "Magnet link queued with qBittorrent.",
-  }
-  if _wants_json(request):
-    return jsonify(payload), status_code
-  return render_template_string(
-    TEMPLATE,
-    message=f"Magnet accepted as job {payload['job_id']} (status {payload['status']}).",
-  ), status_code
-
-
-@app.get("/jobs/<job_id>")
-def job_status(job_id: str) -> Response:
-  job = _load_job(job_id)
-  if not job:
-    return jsonify({"error": f"Job '{job_id}' not found."}), 404
-  return jsonify(job)
-
-
 def _dispatch_to_qbittorrent(
+  *,
   magnet_link: str,
   info_hash: Optional[str],
   qb_cfg: QbittorrentConfig,
+  retry: RetryPolicy,
+  qb_client: Optional[QbittorrentClient],
+  logs: LogStorage,
 ) -> Dict[str, Any]:
-  client = QBITTORRENT_CLIENT
+  client = qb_client
   if not client:
     return {"ok": False, "message": "qBittorrent client is not configured.", "status": 500}
 
   try:
     version = client.health_check()
+  except AuthenticationError as exc:
+    return {
+      "ok": False,
+      "message": f"qBittorrent authentication failed: {exc}",
+      "status": 401,
+    }
   except TorrentServerUnavailable as exc:
     return {
       "ok": False,
@@ -291,12 +289,35 @@ def _dispatch_to_qbittorrent(
     }
 
   try:
-    _enqueue_with_retry(client, magnet_link, category=qb_cfg.category)
+    _enqueue_with_retry(
+      client,
+      magnet_link,
+      category=qb_cfg.category,
+      retry=retry,
+    )
   except TorrentDuplicateError as exc:
     return {
       "ok": False,
       "message": str(exc),
       "status": 409,
+    }
+  except AuthenticationError as exc:
+    return {
+      "ok": False,
+      "message": f"qBittorrent authentication failed while queuing: {exc}",
+      "status": 401,
+    }
+  except TorrentServerUnavailable as exc:
+    return {
+      "ok": False,
+      "message": f"qBittorrent became unreachable: {exc}",
+      "status": 503,
+    }
+  except TorrentRejectedError as exc:
+    return {
+      "ok": False,
+      "message": f"qBittorrent rejected the magnet link: {exc}",
+      "status": 422,
     }
   except QbittorrentError as exc:
     return {
@@ -314,22 +335,31 @@ def _dispatch_to_qbittorrent(
     "queued_at": datetime.now(timezone.utc).isoformat(),
     "qbittorrent_version": version,
   }
-  _log_job(job)
+  logs.jobs.append(job)
   return {"ok": True, "job": job}
 
 
-def _enqueue_with_retry(client: QbittorrentClient, magnet_link: str, *, category: str) -> None:
-  delay = 0.25
-  attempts = 3
-  for attempt in range(1, attempts + 1):
+def _enqueue_with_retry(
+  client: QbittorrentClient,
+  magnet_link: str,
+  *,
+  category: str,
+  retry: RetryPolicy,
+) -> None:
+  delay = retry.initial_delay
+  for attempt in range(1, retry.attempts + 1):
     try:
       client.add_magnet(magnet_link, category=category)
       return
     except TorrentServerUnavailable:
-      if attempt == attempts:
+      if attempt == retry.attempts:
         raise
-      time.sleep(delay)
-      delay *= 2
+      if delay > 0:
+        time.sleep(delay)
+      delay *= retry.backoff_factor
+
+
+app = create_app()
 
 
 if __name__ == "__main__":
