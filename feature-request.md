@@ -1,8 +1,7 @@
 Features
 - [x] verify magnet link validity
-- [ ] qBittorrent Docker integration
-  - Add the `linuxserver/qbittorrent` image via Docker Compose.
-  - Provide a helper script that boots both the Python server and qBittorrent stack.
-  - Implement communication from the Python server to qBittorrent so that it can verify the container is running and send magnet links for download.
-- [ ] On the same server it is hosting a qbittorrent image. send the magnet link to torrent app and start the download.
+- [x] qBittorrent Docker integration
+  - Added the `linuxserver/qbittorrent` image via Docker Compose with health checks and persisted volumes.
+  - Provided `scripts/start_stack.sh` to launch both the Flask server and qBittorrent, including readiness verification.
+  - Implemented qBittorrent communication inside the Python server so it can verify the container is running, enqueue magnets, and expose job metadata.
 - [ ] Create a CI/CD pipe line.
