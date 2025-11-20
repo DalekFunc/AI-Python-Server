@@ -1,3 +1,5 @@
+import base64
+
 from magnet import validate_magnet
 
 
@@ -25,7 +27,7 @@ def test_validate_magnet_rejects_invalid_btih_length():
   result = validate_magnet("magnet:?xt=urn:btih:abc123")
 
   assert result.is_valid is False
-  assert "BTIH info hash must be 40 hexadecimal characters." in result.errors
+  assert any("info hash" in err.lower() for err in result.errors)
 
 
 def test_validate_magnet_rejects_whitespace_characters():
@@ -35,3 +37,22 @@ def test_validate_magnet_rejects_whitespace_characters():
 
   assert result.is_valid is False
   assert any("whitespace" in err.lower() for err in result.errors)
+
+
+def test_validate_magnet_accepts_base32_btih():
+  hex_hash = "0123456789abcdef0123456789abcdef01234567"
+  base32_hash = base64.b32encode(bytes.fromhex(hex_hash)).decode("ascii")
+  magnet = f"magnet:?xt=urn:btih:{base32_hash}&dn=Base32"
+
+  result = validate_magnet(magnet)
+
+  assert result.is_valid is True
+  assert result.components["info_hash"] == hex_hash
+
+
+def test_validate_magnet_rejects_invalid_base32_btih():
+  bogus_base32 = "!" * 32
+  result = validate_magnet(f"magnet:?xt=urn:btih:{bogus_base32}")
+
+  assert result.is_valid is False
+  assert any("base32" in err.lower() for err in result.errors)

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 BTIH_PREFIX = "urn:btih:"
 BTIH_HEX_LENGTH = 40
+BTIH_BASE32_LENGTH = 32
 
 
 @dataclass
@@ -88,10 +91,11 @@ def validate_magnet(
       errors.append("xt parameter must start with 'urn:btih:'.")
     else:
       info_hash = xt_value[len(BTIH_PREFIX) :]
-      if len(info_hash) != BTIH_HEX_LENGTH or not _is_hex(info_hash):
-        errors.append("BTIH info hash must be 40 hexadecimal characters.")
+      ok, normalized_hash, err = _normalize_info_hash(info_hash)
+      if ok and normalized_hash:
+        components["info_hash"] = normalized_hash
       else:
-        components["info_hash"] = info_hash.lower()
+        errors.append(err or "Invalid BTIH info hash.")
 
   display_name = params.get("dn", [None])[0]
   if display_name:
@@ -122,6 +126,30 @@ def validate_magnet(
     components=components,
     errors=errors,
     reachability=reachability,
+  )
+
+
+def _normalize_info_hash(value: str) -> Tuple[bool, Optional[str], Optional[str]]:
+  candidate = value or ""
+  candidate = candidate.strip()
+  if len(candidate) == BTIH_HEX_LENGTH and _is_hex(candidate):
+    return True, candidate.lower(), None
+
+  if len(candidate) == BTIH_BASE32_LENGTH:
+    try:
+      decoded = base64.b32decode(candidate.upper(), casefold=True)
+    except binascii.Error as exc:
+      return False, None, f"BTIH base32 decoding failed: {exc}."
+
+    if len(decoded) != BTIH_HEX_LENGTH // 2:
+      return False, None, "Decoded BTIH info hash must be 20 bytes."
+
+    return True, decoded.hex(), None
+
+  return (
+    False,
+    None,
+    "BTIH info hash must be 40 hexadecimal characters or 32 base32 characters.",
   )
 
 
