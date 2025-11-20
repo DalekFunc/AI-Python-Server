@@ -1,15 +1,17 @@
-import importlib
 import json
-import os
-import sys
 from pathlib import Path
 
 import pytest
 
+from qbittorrent import TorrentDuplicateError, TorrentServerUnavailable
+
+from app import create_app
+from config import load_config
+
 
 @pytest.fixture
 def app_loader(tmp_path, monkeypatch):
-  def _load(**env_overrides):
+  def _load(*, qb_client=None, **env_overrides):
     base_env = {
       "SUBMISSION_LOG_PATH": str(tmp_path / "submissions.jsonl"),
       "TORRENT_JOB_LOG_PATH": str(tmp_path / "jobs.jsonl"),
@@ -19,18 +21,25 @@ def app_loader(tmp_path, monkeypatch):
     for key, value in merged_env.items():
       monkeypatch.setenv(key, value)
 
-    if "app" in sys.modules:
-      del sys.modules["app"]
+    config = load_config()
 
-    module = importlib.import_module("app")
-    return module, Path(merged_env["SUBMISSION_LOG_PATH"]), Path(merged_env["TORRENT_JOB_LOG_PATH"])
+    qb_factory = None
+    if qb_client is not None:
+      def _factory(_cfg):
+        return qb_client
+
+      qb_factory = _factory
+
+    app = create_app(config=config, qb_client_factory=qb_factory)
+
+    return app, Path(merged_env["SUBMISSION_LOG_PATH"]), Path(merged_env["TORRENT_JOB_LOG_PATH"])
 
   return _load
 
 
 def test_submit_rejects_invalid_magnet_and_logs_reason(app_loader):
-  module, log_path, _ = app_loader()
-  client = module.app.test_client()
+  app, log_path, _ = app_loader()
+  client = app.test_client()
 
   response = client.post("/submit", data={"magnet": "magnet:?dn=no_xt"})
 
@@ -47,8 +56,8 @@ def test_submit_rejects_invalid_magnet_and_logs_reason(app_loader):
 
 
 def test_submit_acknowledges_when_qbittorrent_disabled(app_loader):
-  module, _, job_log_path = app_loader()
-  client = module.app.test_client()
+  app, _, job_log_path = app_loader()
+  client = app.test_client()
 
   valid_magnet = "magnet:?xt=urn:btih:{hash}&dn=Example".format(hash="A" * 40)
   response = client.post("/submit", data={"magnet": valid_magnet})
@@ -59,14 +68,6 @@ def test_submit_acknowledges_when_qbittorrent_disabled(app_loader):
 
 
 def test_submit_enqueues_when_qbittorrent_enabled(app_loader):
-  module, _, job_log_path = app_loader(
-    QB_ENABLED="1",
-    QB_URL="http://localhost:8081",
-    QB_USER="admin",
-    QB_PASS="adminadmin",
-    QB_CATEGORY="Smoke",
-  )
-
   class StubClient:
     def __init__(self):
       self.health_checks = 0
@@ -80,10 +81,18 @@ def test_submit_enqueues_when_qbittorrent_enabled(app_loader):
       self.add_calls.append((magnet_link, category))
 
   stub = StubClient()
-  module.QBITTORRENT_CLIENT = stub
+
+  app, _, job_log_path = app_loader(
+    qb_client=stub,
+    QB_ENABLED="1",
+    QB_URL="http://localhost:8081",
+    QB_USER="admin",
+    QB_PASS="adminadmin",
+    QB_CATEGORY="Smoke",
+  )
 
   valid_magnet = "magnet:?xt=urn:btih:{hash}&dn=Example".format(hash="B" * 40)
-  response = module.app.test_client().post("/submit", data={"magnet": valid_magnet})
+  response = app.test_client().post("/submit", data={"magnet": valid_magnet})
 
   assert response.status_code == 202
   assert stub.health_checks == 1
@@ -94,3 +103,78 @@ def test_submit_enqueues_when_qbittorrent_enabled(app_loader):
   job_entry = json.loads(log_lines[-1])
   assert job_entry["info_hash"] == "b" * 40
   assert job_entry["status"] == "queued"
+
+
+def test_submit_returns_conflict_on_duplicate_torrent(app_loader):
+  class StubClient:
+    def health_check(self):
+      return "4.6.4"
+
+    def add_magnet(self, *_args, **_kwargs):
+      raise TorrentDuplicateError("Magnet already exists.")
+
+  stub = StubClient()
+  app, _, _ = app_loader(
+    qb_client=stub,
+    QB_ENABLED="1",
+    QB_URL="http://localhost:8081",
+    QB_USER="user",
+    QB_PASS="pass",
+  )
+  valid_magnet = "magnet:?xt=urn:btih:{hash}&dn=Example".format(hash="C" * 40)
+
+  response = app.test_client().post("/submit", data={"magnet": valid_magnet})
+
+  assert response.status_code == 409
+  assert b"already exists" in response.data
+
+
+def test_submit_reports_unreachable_qbittorrent(app_loader):
+  class StubClient:
+    def health_check(self):
+      raise TorrentServerUnavailable("connection refused")
+
+  stub = StubClient()
+  app, _, _ = app_loader(
+    qb_client=stub,
+    QB_ENABLED="1",
+    QB_URL="http://localhost:8081",
+    QB_USER="user",
+    QB_PASS="pass",
+  )
+  valid_magnet = "magnet:?xt=urn:btih:{hash}&dn=Example".format(hash="D" * 40)
+
+  response = app.test_client().post("/submit", data={"magnet": valid_magnet})
+
+  assert response.status_code == 503
+  assert b"unreachable" in response.data
+
+
+def test_reachability_probe_toggle_logs_tracker(monkeypatch, app_loader):
+  class DummyResponse:
+    def __init__(self, status_code):
+      self.status_code = status_code
+
+  def fake_head(url, **_kwargs):
+    fake_head.called = True
+    return DummyResponse(204)
+
+  fake_head.called = False
+  monkeypatch.setattr("requests.head", fake_head)
+
+  app, log_path, _ = app_loader(MAGNET_REACHABILITY_PROBE="1")
+  client = app.test_client()
+
+  magnet = "magnet:?xt=urn:btih:{hash}&dn=Example&tr=https://tracker.example.com/announce".format(
+    hash="E" * 40
+  )
+  response = client.post("/submit", data={"magnet": magnet})
+
+  assert response.status_code == 200
+  assert fake_head.called is True
+
+  last_entry = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+  reachability = last_entry["validation"]["reachability"]
+  assert reachability["enabled"] is True
+  assert reachability["succeeded"] is True
+  assert reachability["tracker_url"] == "https://tracker.example.com/announce"

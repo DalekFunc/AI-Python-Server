@@ -2,10 +2,15 @@
 name = "ai-python-server"
 version = "0.1.0"
 description = "magnet drop webpage for self-hosted torrent machine"
+requires-python = ">=3.14"
 dependencies = [
     "flask>=3.0",
-    "pytest>=8.0",
     "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
 ]
 
 [build-system]
