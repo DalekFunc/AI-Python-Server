@@ -8,7 +8,7 @@ Automate the homelab workflow so every change is linted/tested and a ready-to-ru
    - GitHub Actions workflow triggered on `push` and `pull_request`.
    - Nightly `workflow_dispatch` option for manual “rebuild homelab” runs.
 2. **Jobs**
-   - `lint-and-test`: Python 3.11, install `requirements.txt`, run formatter/lint (ruff or flake8) and `pytest`.
+   - `lint-and-test`: Python 3.14, install `requirements.txt`, run formatter/lint (ruff or flake8) and `pytest`.
    - `build-and-package`: build Docker image locally (no registry push) and export with `docker save` + tar the `docker-compose.yml` and `.env.example` for easy homelab import.
 3. **Caches & secrets**
    - Enable pip cache to keep runs fast.
