@@ -24,10 +24,21 @@ class QbittorrentConfig:
 
 
 @dataclass(frozen=True)
+class YouTubeConfig:
+  """Configuration for YouTube download integration."""
+
+  download_path: Path
+  format: str = "bestvideo"
+  timeout: float = 300.0
+  ytdlp_command: str = "yt-dlp"
+
+
+@dataclass(frozen=True)
 class AppConfig:
   """Top-level configuration for the Flask application."""
 
   qbittorrent: Optional[QbittorrentConfig]
+  youtube: Optional[YouTubeConfig]
   job_log_path: Path
 
 
@@ -68,7 +79,24 @@ def load_config() -> AppConfig:
       timeout=qb_timeout,
     )
 
-  return AppConfig(qbittorrent=qb_config, job_log_path=job_log_path)
+  # YouTube download configuration
+  yt_enabled = _env_flag("YT_ENABLED", "1")  # Enabled by default
+  yt_config: Optional[YouTubeConfig] = None
+  if yt_enabled:
+    yt_download_path = Path(os.environ.get("YT_DOWNLOAD_PATH", "downloads/youtube"))
+    yt_download_path.mkdir(parents=True, exist_ok=True)
+    yt_format = os.environ.get("YT_FORMAT", "bestvideo").strip() or "bestvideo"
+    yt_timeout = float(os.environ.get("YT_TIMEOUT", "300.0"))
+    yt_ytdlp_command = os.environ.get("YT_YTDLP_COMMAND", "yt-dlp").strip() or "yt-dlp"
+
+    yt_config = YouTubeConfig(
+      download_path=yt_download_path,
+      format=yt_format,
+      timeout=yt_timeout,
+      ytdlp_command=yt_ytdlp_command,
+    )
+
+  return AppConfig(qbittorrent=qb_config, youtube=yt_config, job_log_path=job_log_path)
 
 
-__all__ = ["AppConfig", "QbittorrentConfig", "load_config"]
+__all__ = ["AppConfig", "QbittorrentConfig", "YouTubeConfig", "load_config"]

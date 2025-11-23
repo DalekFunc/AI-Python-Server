@@ -1,11 +1,12 @@
 # Magnet Drop Test Server
 
-Small Flask application that mimics a minimalist Google-like home page with a wide input box for submitting magnet links. Every submission is appended to `logs/submissions.jsonl` as one JSON object per line, capturing the magnet link, received timestamp (UTC), client IP, and user agent.
+Small Flask application that mimics a minimalist Google-like home page with a wide input box for submitting magnet links and YouTube URLs. Every submission is appended to `logs/submissions.jsonl` as one JSON object per line, capturing the input, received timestamp (UTC), client IP, and user agent.
 
 ## Requirements
 
 - Python 3.14 (or the closest available Python 3.12+ interpreter)
 - `pip install -r requirements.txt`
+- `yt-dlp` installed and available in PATH (for YouTube downloads)
 - Docker + `docker compose` if you want to run the bundled qBittorrent stack
 
 ## Running
@@ -32,6 +33,21 @@ python3 app.py
 
 When enabled, every valid magnet is queued through qBittorrent, logged with a job identifier, and exposed via `GET /jobs/<job_id>`.
 
+### With YouTube download
+
+YouTube download integration is enabled by default. To disable it, set `YT_ENABLED=0`. When enabled, the server accepts YouTube URLs and downloads videos using `yt-dlp`:
+
+```bash
+python3 app.py
+```
+
+You can submit YouTube URLs in various formats:
+- `https://www.youtube.com/watch?v=VIDEO_ID`
+- `https://youtu.be/VIDEO_ID`
+- `https://youtube.com/embed/VIDEO_ID`
+
+Downloaded videos are stored in the directory specified by `YT_DOWNLOAD_PATH` (default: `downloads/youtube/`).
+
 ## Configuration
 
 | Variable | Description | Default |
@@ -45,6 +61,11 @@ When enabled, every valid magnet is queued through qBittorrent, logged with a jo
 | `QB_USER` / `QB_PASS` | WebUI credentials. | _required when enabled_ |
 | `QB_CATEGORY` | Category/name assigned to queued torrents. | `MagnetDrop` |
 | `QB_TIMEOUT` | HTTP timeout (seconds) for qBittorrent API calls. | `10.0` |
+| `YT_ENABLED` | `"1"` to enable YouTube download integration. | `1` (enabled by default) |
+| `YT_DOWNLOAD_PATH` | Directory where YouTube videos are downloaded. | `downloads/youtube` |
+| `YT_FORMAT` | Video format selector for yt-dlp (e.g., `bestvideo`, `best`). | `bestvideo` |
+| `YT_TIMEOUT` | Maximum time (seconds) for download operations. | `300.0` |
+| `YT_YTDLP_COMMAND` | Command to invoke yt-dlp (useful if not in PATH). | `yt-dlp` |
 
 ## qBittorrent stack & helper script
 
@@ -85,3 +106,47 @@ Submission log entries live in `logs/submissions.jsonl`, e.g.:
 ```
 
 When qBittorrent integration is enabled, each accepted magnet produces a job entry in `logs/jobs.jsonl`, including a server-generated `job_id`, the normalized info hash, and the qBittorrent version that accepted the job. Query `GET /jobs/<job_id>` to retrieve the raw JSON payload for the latest state (currently persisted at enqueue time).
+
+Similarly, YouTube downloads are logged with a `type: "youtube"` field, including the video ID, title, duration, and output file path.
+
+## YouTube Download Feature
+
+The server supports downloading YouTube videos using `yt-dlp`. Videos are downloaded in video-only format by default (audio track is ignored as per the initial implementation).
+
+### Installing yt-dlp
+
+Install `yt-dlp` using one of these methods:
+
+```bash
+# Using pip
+pip install yt-dlp
+
+# Using homebrew (macOS)
+brew install yt-dlp
+
+# Or download from https://github.com/yt-dlp/yt-dlp/releases
+```
+
+Ensure `yt-dlp` is available in your PATH, or specify the command path using `YT_YTDLP_COMMAND`.
+
+### Supported YouTube URL Formats
+
+- `https://www.youtube.com/watch?v=VIDEO_ID`
+- `https://youtu.be/VIDEO_ID`
+- `https://youtube.com/embed/VIDEO_ID`
+- `https://youtube.com/v/VIDEO_ID`
+- Mobile URLs: `https://m.youtube.com/watch?v=VIDEO_ID`
+
+### Troubleshooting
+
+**yt-dlp not found**: Ensure `yt-dlp` is installed and in your PATH, or set `YT_YTDLP_COMMAND` to the full path.
+
+**Video unavailable**: Some videos may be unavailable due to:
+- Age restrictions
+- Geographic restrictions
+- Deleted or private videos
+- Copyright claims
+
+**Download timeout**: Increase `YT_TIMEOUT` for large videos or slow connections.
+
+**Format issues**: Adjust `YT_FORMAT` if you need different video quality or format. See [yt-dlp format selection](https://github.com/yt-dlp/yt-dlp#format-selection) for options.

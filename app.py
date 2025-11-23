@@ -15,13 +15,19 @@ from typing import Any, Dict, Optional
 
 from flask import Flask, Request, Response, jsonify, render_template_string, request
 
-from config import AppConfig, QbittorrentConfig, load_config
+from config import AppConfig, QbittorrentConfig, YouTubeConfig, load_config
 from magnet import validate_magnet
 from qbittorrent import (
   QbittorrentClient,
   QbittorrentError,
   TorrentDuplicateError,
   TorrentServerUnavailable,
+)
+from youtube import (
+  YouTubeDownloadClient,
+  YouTubeDownloadError,
+  YouTubeVideoUnavailableError,
+  validate_youtube_url,
 )
 
 
@@ -44,6 +50,16 @@ if APP_CONFIG.qbittorrent:
     password=qb_cfg.password,
     category=qb_cfg.category,
     timeout=qb_cfg.timeout,
+  )
+
+YOUTUBE_CLIENT: Optional[YouTubeDownloadClient] = None
+if APP_CONFIG.youtube:
+  yt_cfg = APP_CONFIG.youtube
+  YOUTUBE_CLIENT = YouTubeDownloadClient(
+    download_path=yt_cfg.download_path,
+    format=yt_cfg.format,
+    timeout=yt_cfg.timeout,
+    ytdlp_command=yt_cfg.ytdlp_command,
   )
 
 app = Flask(__name__)
@@ -129,6 +145,46 @@ TEMPLATE = """
         font-size: 1rem;
         color: #0f9d58;
       }
+
+      .message.error {
+        color: #ea4335;
+      }
+
+      .help-text {
+        margin-top: 2rem;
+        padding: 1rem;
+        background-color: #ffffff;
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        text-align: left;
+        max-width: 600px;
+        font-size: 0.9rem;
+        color: #5f6368;
+      }
+
+      .help-text h3 {
+        margin-top: 0;
+        margin-bottom: 0.5rem;
+        font-size: 1rem;
+        color: #202124;
+      }
+
+      .help-text ul {
+        margin: 0.5rem 0;
+        padding-left: 1.5rem;
+      }
+
+      .help-text li {
+        margin: 0.25rem 0;
+      }
+
+      .help-text code {
+        background-color: #f1f3f4;
+        padding: 0.1rem 0.3rem;
+        border-radius: 3px;
+        font-family: monospace;
+        font-size: 0.85em;
+      }
     </style>
   </head>
   <body>
@@ -139,14 +195,27 @@ TEMPLATE = """
           <input
             type="text"
             name="magnet"
-            placeholder="Paste your magnet link here"
+            placeholder="Paste magnet link or YouTube URL here"
             required
           />
           <button type="submit">Send</button>
         </form>
         {% if message %}
-        <div class="message">{{ message }}</div>
+        <div class="message{% if 'error' in message.lower() or 'invalid' in message.lower() or 'failed' in message.lower() or 'unavailable' in message.lower() %} error{% endif %}">{{ message }}</div>
         {% endif %}
+        <div class="help-text">
+          <h3>Accepted Input Formats</h3>
+          <ul>
+            <li><strong>Magnet Links:</strong> <code>magnet:?xt=urn:btih:...</code></li>
+            <li><strong>YouTube URLs:</strong>
+              <ul>
+                <li><code>https://www.youtube.com/watch?v=VIDEO_ID</code></li>
+                <li><code>https://youtu.be/VIDEO_ID</code></li>
+                <li><code>https://youtube.com/embed/VIDEO_ID</code></li>
+              </ul>
+            </li>
+          </ul>
+        </div>
       </div>
     </main>
   </body>
@@ -193,6 +262,17 @@ def _wants_json(req: Request) -> bool:
   return "application/json" in accept_header.lower()
 
 
+def _detect_input_type(input_str: str) -> str:
+  """Detect if input is a magnet link or YouTube URL."""
+  input_str = input_str.strip().lower()
+  if input_str.startswith("magnet:?"):
+    return "magnet"
+  if any(domain in input_str for domain in ["youtube.com", "youtu.be"]):
+    return "youtube"
+  # Default to magnet for backward compatibility
+  return "magnet"
+
+
 @app.get("/")
 def home() -> str:
   return render_template_string(TEMPLATE, message=None)
@@ -200,68 +280,134 @@ def home() -> str:
 
 @app.post("/submit")
 def submit() -> Response | str:
-  magnet_link = request.form.get("magnet", "").strip()
-  if not magnet_link:
+  input_str = request.form.get("magnet", "").strip()
+  if not input_str:
     return render_template_string(
       TEMPLATE,
-      message="Please provide a magnet link.",
+      message="Please provide a magnet link or YouTube URL.",
     )
 
-  validation = validate_magnet(
-    magnet_link,
-    probe_reachability=app.config["MAGNET_REACHABILITY_PROBE"],
-    probe_timeout=app.config["MAGNET_REACHABILITY_TIMEOUT"],
-  )
+  input_type = _detect_input_type(input_str)
 
-  entry = {
-    "received_at": datetime.now(timezone.utc).isoformat(),
-    "client_ip": _client_ip(request),
-    "user_agent": request.headers.get("User-Agent", ""),
-    "magnet_link": magnet_link,
-    "status": "accepted" if validation.is_valid else "rejected",
-    "validation": validation.to_dict(),
-  }
-  _log_submission(entry)
-
-  if not validation.is_valid:
-    reasons = "; ".join(validation.errors)
-    return (
-      render_template_string(TEMPLATE, message=f"Invalid magnet link: {reasons}"),
-      400,
+  # Handle magnet links
+  if input_type == "magnet":
+    validation = validate_magnet(
+      input_str,
+      probe_reachability=app.config["MAGNET_REACHABILITY_PROBE"],
+      probe_timeout=app.config["MAGNET_REACHABILITY_TIMEOUT"],
     )
 
-  if not APP_CONFIG.qbittorrent:
-    return render_template_string(
-      TEMPLATE,
-      message="Magnet link received. qBittorrent integration is disabled.",
+    entry = {
+      "received_at": datetime.now(timezone.utc).isoformat(),
+      "client_ip": _client_ip(request),
+      "user_agent": request.headers.get("User-Agent", ""),
+      "input_type": "magnet",
+      "magnet_link": input_str,
+      "status": "accepted" if validation.is_valid else "rejected",
+      "validation": validation.to_dict(),
+    }
+    _log_submission(entry)
+
+    if not validation.is_valid:
+      reasons = "; ".join(validation.errors)
+      return (
+        render_template_string(TEMPLATE, message=f"Invalid magnet link: {reasons}"),
+        400,
+      )
+
+    if not APP_CONFIG.qbittorrent:
+      return render_template_string(
+        TEMPLATE,
+        message="Magnet link received. qBittorrent integration is disabled.",
+      )
+
+    enqueue_result = _dispatch_to_qbittorrent(
+      input_str,
+      validation.components.get("info_hash"),
+      APP_CONFIG.qbittorrent,
     )
 
-  enqueue_result = _dispatch_to_qbittorrent(
-    magnet_link,
-    validation.components.get("info_hash"),
-    APP_CONFIG.qbittorrent,
-  )
+    if not enqueue_result["ok"]:
+      payload = {"error": enqueue_result["message"]}
+      status_code = enqueue_result["status"]
+      if _wants_json(request):
+        return jsonify(payload), status_code
+      return render_template_string(TEMPLATE, message=enqueue_result["message"]), status_code
 
-  if not enqueue_result["ok"]:
-    payload = {"error": enqueue_result["message"]}
-    status_code = enqueue_result["status"]
+    status_code = 202
+    payload = {
+      "job_id": enqueue_result["job"]["job_id"],
+      "info_hash": enqueue_result["job"]["info_hash"],
+      "status": enqueue_result["job"]["status"],
+      "message": "Magnet link queued with qBittorrent.",
+    }
     if _wants_json(request):
       return jsonify(payload), status_code
-    return render_template_string(TEMPLATE, message=enqueue_result["message"]), status_code
+    return render_template_string(
+      TEMPLATE,
+      message=f"Magnet accepted as job {payload['job_id']} (status {payload['status']}).",
+    ), status_code
 
-  status_code = 202
-  payload = {
-    "job_id": enqueue_result["job"]["job_id"],
-    "info_hash": enqueue_result["job"]["info_hash"],
-    "status": enqueue_result["job"]["status"],
-    "message": "Magnet link queued with qBittorrent.",
-  }
-  if _wants_json(request):
-    return jsonify(payload), status_code
+  # Handle YouTube URLs
+  elif input_type == "youtube":
+    validation = validate_youtube_url(input_str)
+
+    entry = {
+      "received_at": datetime.now(timezone.utc).isoformat(),
+      "client_ip": _client_ip(request),
+      "user_agent": request.headers.get("User-Agent", ""),
+      "input_type": "youtube",
+      "youtube_url": input_str,
+      "status": "accepted" if validation.is_valid else "rejected",
+      "validation": validation.to_dict(),
+    }
+    _log_submission(entry)
+
+    if not validation.is_valid:
+      reasons = "; ".join(validation.errors)
+      return (
+        render_template_string(TEMPLATE, message=f"Invalid YouTube URL: {reasons}"),
+        400,
+      )
+
+    if not APP_CONFIG.youtube:
+      return render_template_string(
+        TEMPLATE,
+        message="YouTube URL received. YouTube download integration is disabled.",
+      ), 503
+
+    download_result = _dispatch_to_youtube(
+      input_str,
+      validation.video_id or "",
+      APP_CONFIG.youtube,
+    )
+
+    if not download_result["ok"]:
+      payload = {"error": download_result["message"]}
+      status_code = download_result["status"]
+      if _wants_json(request):
+        return jsonify(payload), status_code
+      return render_template_string(TEMPLATE, message=download_result["message"]), status_code
+
+    status_code = 202
+    payload = {
+      "job_id": download_result["job"]["job_id"],
+      "video_id": download_result["job"]["video_id"],
+      "status": download_result["job"]["status"],
+      "message": "YouTube video download started.",
+    }
+    if _wants_json(request):
+      return jsonify(payload), status_code
+    return render_template_string(
+      TEMPLATE,
+      message=f"YouTube video accepted as job {payload['job_id']} (status {payload['status']}).",
+    ), status_code
+
+  # Should not reach here
   return render_template_string(
     TEMPLATE,
-    message=f"Magnet accepted as job {payload['job_id']} (status {payload['status']}).",
-  ), status_code
+    message="Unable to determine input type. Please provide a valid magnet link or YouTube URL.",
+  ), 400
 
 
 @app.get("/jobs/<job_id>")
@@ -330,6 +476,52 @@ def _enqueue_with_retry(client: QbittorrentClient, magnet_link: str, *, category
         raise
       time.sleep(delay)
       delay *= 2
+
+
+def _dispatch_to_youtube(
+  url: str,
+  video_id: str,
+  yt_cfg: YouTubeConfig,
+) -> Dict[str, Any]:
+  client = YOUTUBE_CLIENT
+  if not client:
+    return {"ok": False, "message": "YouTube download client is not configured.", "status": 500}
+
+  try:
+    download_result = client.download_video(url, video_id)
+  except YouTubeVideoUnavailableError as exc:
+    return {
+      "ok": False,
+      "message": f"YouTube video is unavailable: {exc}",
+      "status": 404,
+    }
+  except YouTubeDownloadError as exc:
+    return {
+      "ok": False,
+      "message": f"Failed to download YouTube video: {exc}",
+      "status": 502,
+    }
+  except Exception as exc:
+    return {
+      "ok": False,
+      "message": f"Unexpected error during YouTube download: {exc}",
+      "status": 500,
+    }
+
+  job = {
+    "job_id": uuid.uuid4().hex,
+    "type": "youtube",
+    "video_id": video_id,
+    "youtube_url": url,
+    "status": "completed" if download_result.success else "failed",
+    "queued_at": datetime.now(timezone.utc).isoformat(),
+    "title": download_result.title,
+    "duration": download_result.duration,
+    "output_path": str(download_result.output_path) if download_result.output_path else None,
+    "file_size": download_result.file_size,
+  }
+  _log_job(job)
+  return {"ok": True, "job": job}
 
 
 if __name__ == "__main__":
