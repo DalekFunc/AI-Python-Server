@@ -94,3 +94,43 @@ def test_submit_enqueues_when_qbittorrent_enabled(app_loader):
   job_entry = json.loads(log_lines[-1])
   assert job_entry["info_hash"] == "b" * 40
   assert job_entry["status"] == "queued"
+
+
+def test_submit_accepts_page_url_and_resolves_magnet(app_loader, monkeypatch):
+  module, log_path, _ = app_loader()
+
+  info_hash = "C" * 40
+  expected_magnet = f"magnet:?xt=urn:btih:{info_hash}&dn=FromPage"
+  html_doc = f'<html><a href="{expected_magnet}">download</a></html>'
+
+  class StubResponse:
+    def __init__(self, body: bytes):
+      self._body = body
+      self.status_code = 200
+      self.encoding = "utf-8"
+
+    def raise_for_status(self):
+      return None
+
+    def iter_content(self, chunk_size: int = 65536):
+      yield self._body
+
+  def stub_get(*args, **kwargs):
+    return StubResponse(html_doc.encode("utf-8"))
+
+  import requests
+
+  monkeypatch.setattr(requests, "get", stub_get)
+
+  submitted_url = "https://example.com/post/123"
+  response = module.app.test_client().post("/submit", data={"magnet": submitted_url})
+
+  assert response.status_code == 200
+  assert b"qBittorrent integration is disabled" in response.data
+
+  log_lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+  assert log_lines, "Expected at least one log entry."
+  last_entry = json.loads(log_lines[-1])
+  assert last_entry["submitted_value"] == submitted_url
+  assert last_entry["source_url"] == submitted_url
+  assert last_entry["magnet_link"] == expected_magnet

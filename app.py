@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 from flask import Flask, Request, Response, jsonify, render_template_string, request
 
 from config import AppConfig, QbittorrentConfig, load_config
-from magnet import validate_magnet
+from magnet import MagnetResolutionError, resolve_to_magnet, validate_magnet
 from qbittorrent import (
   QbittorrentClient,
   QbittorrentError,
@@ -50,6 +50,8 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("APP_SECRET_KEY", "dev-secret-key")
 app.config["MAGNET_REACHABILITY_PROBE"] = _env_flag("MAGNET_REACHABILITY_PROBE", "0")
 app.config["MAGNET_REACHABILITY_TIMEOUT"] = float(os.environ.get("MAGNET_REACHABILITY_TIMEOUT", "2.0"))
+app.config["MAGNET_PAGE_FETCH_TIMEOUT"] = float(os.environ.get("MAGNET_PAGE_FETCH_TIMEOUT", "5.0"))
+app.config["MAGNET_PAGE_FETCH_MAX_BYTES"] = int(os.environ.get("MAGNET_PAGE_FETCH_MAX_BYTES", "2000000"))
 app.config["APP_CONFIG"] = APP_CONFIG
 
 
@@ -139,7 +141,7 @@ TEMPLATE = """
           <input
             type="text"
             name="magnet"
-            placeholder="Paste your magnet link here"
+            placeholder="Paste a magnet link or a page URL containing one"
             required
           />
           <button type="submit">Send</button>
@@ -200,12 +202,36 @@ def home() -> str:
 
 @app.post("/submit")
 def submit() -> Response | str:
-  magnet_link = request.form.get("magnet", "").strip()
-  if not magnet_link:
+  submitted_value = request.form.get("magnet", "").strip()
+  if not submitted_value:
     return render_template_string(
       TEMPLATE,
       message="Please provide a magnet link.",
     )
+
+  try:
+    resolved = resolve_to_magnet(
+      submitted_value,
+      fetch_timeout=app.config["MAGNET_PAGE_FETCH_TIMEOUT"],
+      max_bytes=app.config["MAGNET_PAGE_FETCH_MAX_BYTES"],
+    )
+  except MagnetResolutionError as exc:
+    entry = {
+      "received_at": datetime.now(timezone.utc).isoformat(),
+      "client_ip": _client_ip(request),
+      "user_agent": request.headers.get("User-Agent", ""),
+      "submitted_value": submitted_value,
+      "magnet_link": None,
+      "status": "rejected",
+      "validation": {"is_valid": False, "errors": [str(exc)], "components": {}},
+    }
+    _log_submission(entry)
+    return (
+      render_template_string(TEMPLATE, message=f"Invalid input: {exc}"),
+      400,
+    )
+
+  magnet_link = resolved.magnet_link
 
   validation = validate_magnet(
     magnet_link,
@@ -217,6 +243,8 @@ def submit() -> Response | str:
     "received_at": datetime.now(timezone.utc).isoformat(),
     "client_ip": _client_ip(request),
     "user_agent": request.headers.get("User-Agent", ""),
+    "submitted_value": resolved.submitted_value,
+    "source_url": resolved.source_url,
     "magnet_link": magnet_link,
     "status": "accepted" if validation.is_valid else "rejected",
     "validation": validation.to_dict(),
