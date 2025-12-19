@@ -1,6 +1,13 @@
 import base64
 
-from magnet import validate_magnet
+import pytest
+
+from magnet import (
+  MagnetResolutionError,
+  extract_magnet_links_from_html,
+  resolve_to_magnet,
+  validate_magnet,
+)
 
 
 def test_validate_magnet_accepts_valid_btih():
@@ -56,3 +63,56 @@ def test_validate_magnet_rejects_invalid_base32_btih():
 
   assert result.is_valid is False
   assert any("base32" in err.lower() for err in result.errors)
+
+
+def test_extract_magnet_links_from_html_prefers_href_and_unescapes_ampersands():
+  info_hash = "A" * 40
+  html_doc = f"""
+  <html>
+    <body>
+      <a href="magnet:?xt=urn:btih:{info_hash}&amp;dn=Example&amp;tr=https://tracker.example/announce">Download</a>
+    </body>
+  </html>
+  """
+
+  magnets = extract_magnet_links_from_html(html_doc)
+
+  assert magnets
+  assert magnets[0].startswith("magnet:?xt=urn:btih:")
+  assert "&dn=Example" in magnets[0]
+  assert "&tr=https://tracker.example/announce" in magnets[0]
+
+
+def test_resolve_to_magnet_fetches_page_and_picks_first_valid_magnet(monkeypatch):
+  info_hash = "B" * 40
+  invalid = "magnet:?dn=missing_xt"
+  valid = f"magnet:?xt=urn:btih:{info_hash}&dn=Ok"
+  html_doc = f'<a href="{invalid}">bad</a><a href="{valid}">good</a>'
+
+  class StubResponse:
+    def __init__(self, body: bytes):
+      self._body = body
+      self.status_code = 200
+      self.encoding = "utf-8"
+
+    def raise_for_status(self):
+      return None
+
+    def iter_content(self, chunk_size: int = 65536):
+      yield self._body
+
+  def stub_get(*args, **kwargs):
+    return StubResponse(html_doc.encode("utf-8"))
+
+  import requests
+
+  monkeypatch.setattr(requests, "get", stub_get)
+
+  resolved = resolve_to_magnet("https://example.com/torrent")
+  assert resolved.source_url == "https://example.com/torrent"
+  assert resolved.magnet_link == valid
+
+
+def test_resolve_to_magnet_rejects_youtube_urls():
+  with pytest.raises(MagnetResolutionError):
+    resolve_to_magnet("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
